@@ -50,6 +50,7 @@ Scrape exports are cached per API batch in `/tmp/scrape-fandom/export-batches` b
 
 ```sh
 python3 ScrapeFandom.py jedipedia@de
+python3 ScrapeFandom.py actors@de call-of-duty@de
 python3 ScrapeFandom.py jedipedia@de --no-cache
 python3 ScrapeFandom.py jedipedia@de --refresh-cache
 ```
@@ -110,9 +111,10 @@ Generate one compact cracking base list from the JSONL output:
 ```sh
 uv run fandom-wordlist harrypotter.jsonl
 uv run fandom-wordlist pokemon@de.jsonl
+uv run fandom-wordlist actors@de.jsonl call-of-duty@de.jsonl
 ```
 
-The default output path is derived from the input file. For example, `pokemon@de.jsonl` writes `wordlists/pokemon_de.txt`.
+The default output path is derived from each input file. For example, `pokemon@de.jsonl` writes `wordlists/pokemon_de.txt`, and `call-of-duty@de.jsonl` writes `wordlists/call-of-duty_de.txt`.
 
 The default cap is 250,000 entries. Lower it for a tighter seed list:
 

@@ -232,9 +232,29 @@ def write_dump(
     tmp_output_path.replace(output_path)
 
 
+def scrape_target(args: argparse.Namespace, session: requests.Session, target: str) -> None:
+    fandom_site, language = parse_fandom_target(target)
+    titles = fetch_all_titles(session, fandom_site, language)
+    if not titles:
+        raise RuntimeError(f"No pages found for {target}")
+    write_dump(
+        session,
+        target,
+        fandom_site,
+        language,
+        titles,
+        args.batch_size,
+        None if args.no_cache else args.cache_dir,
+        args.refresh_cache,
+        args.retries,
+        args.retry_delay,
+    )
+    print(f"Wrote {target}.xml with {len(titles)} pages")
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("input_fandom", help="Fandom site name, e.g. harrypotter or harry-potter@de")
+    parser.add_argument("input_fandom", nargs="+", help="Fandom site name(s), e.g. harrypotter or harry-potter@de")
     parser.add_argument("--batch-size", type=int, default=30, help="Number of pages per export API request")
     parser.add_argument(
         "--cache-dir",
@@ -258,29 +278,14 @@ def main() -> int:
     session = requests.Session()
     session.headers.update({"User-Agent": USER_AGENT})
 
-    try:
-        fandom_site, language = parse_fandom_target(args.input_fandom)
-        titles = fetch_all_titles(session, fandom_site, language)
-        if not titles:
-            raise RuntimeError(f"No pages found for {args.input_fandom}")
-        write_dump(
-            session,
-            args.input_fandom,
-            fandom_site,
-            language,
-            titles,
-            args.batch_size,
-            None if args.no_cache else args.cache_dir,
-            args.refresh_cache,
-            args.retries,
-            args.retry_delay,
-        )
-    except Exception as exc:
-        print(f"Scrape failed for {args.input_fandom}: {exc}", file=sys.stderr)
-        return 1
-
-    print(f"Wrote {args.input_fandom}.xml with {len(titles)} pages")
-    return 0
+    failed = False
+    for target in args.input_fandom:
+        try:
+            scrape_target(args, session, target)
+        except Exception as exc:
+            print(f"Scrape failed for {target}: {exc}", file=sys.stderr)
+            failed = True
+    return 1 if failed else 0
 
 
 if __name__ == "__main__":

@@ -310,14 +310,54 @@ def default_output_path(input_path: Path) -> Path:
     return Path("wordlists") / f"{name}.txt"
 
 
+def build_wordlist(args: argparse.Namespace, input_path: Path, output_path: Path) -> int:
+    stopwords = set(STOPWORDS)
+    keepwords = set()
+    if not args.no_default_excludes:
+        for path in DEFAULT_EXCLUDE_FILES:
+            if path.exists():
+                stopwords.update(load_word_file(path))
+    for path in args.exclude_file:
+        stopwords.update(load_word_file(path))
+    keepwords.update(collect_title_keepwords(input_path, args.title_keep_score, stopwords))
+    for path in args.keep_file:
+        keepwords.update(load_word_file(path))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    words, terms, names = read_jsonl(
+        input_path,
+        args.min_len,
+        args.max_len,
+        stopwords,
+        keepwords,
+        args.common_word_max,
+    )
+
+    word_entries = ranked(words, args.min_word_score, args.max_words)
+    term_entries = ranked(terms, args.min_term_score, args.max_terms)
+    name_entries = ranked(names, args.min_name_score, args.max_names)
+
+    seen = set()
+    base_entries = []
+    for entry in [*name_entries, *term_entries, *word_entries]:
+        if entry not in seen:
+            seen.add(entry)
+            base_entries.append(entry)
+        if len(base_entries) >= args.max_base:
+            break
+
+    count = write_list(output_path, base_entries)
+    print(f"wordlist: {count} -> {output_path}")
+    return count
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Extract one compact target-specific wordlist from scraped Fandom JSONL.")
-    parser.add_argument("input", type=Path, help="Input JSONL file produced by json2jsonl.py")
     parser.add_argument(
-        "output",
-        nargs="?",
+        "paths",
+        nargs="+",
         type=Path,
-        help="Output wordlist path. Defaults to wordlists/<input-stem>.txt, with @ replaced by _.",
+        help="Input JSONL file(s). With one input, an optional explicit output path may follow.",
     )
     parser.add_argument("--min-len", type=int, default=4)
     parser.add_argument("--max-len", type=int, default=32)
@@ -366,44 +406,17 @@ def main() -> int:
     if zipf_frequency is None and args.common_word_max is not None:
         print("wordfreq is not installed; falling back to built-in stopword filtering only")
 
-    stopwords = set(STOPWORDS)
-    keepwords = set()
-    if not args.no_default_excludes:
-        for path in DEFAULT_EXCLUDE_FILES:
-            if path.exists():
-                stopwords.update(load_word_file(path))
-    for path in args.exclude_file:
-        stopwords.update(load_word_file(path))
-    keepwords.update(collect_title_keepwords(args.input, args.title_keep_score, stopwords))
-    for path in args.keep_file:
-        keepwords.update(load_word_file(path))
+    inputs = args.paths
+    explicit_output = None
+    if len(args.paths) == 2 and args.paths[0].suffix == ".jsonl" and args.paths[1].suffix != ".jsonl":
+        inputs = [args.paths[0]]
+        explicit_output = args.paths[1]
+    elif len(args.paths) > 1 and any(path.suffix != ".jsonl" for path in args.paths):
+        parser.error("multiple-input mode only accepts .jsonl paths; explicit output is only supported with one input")
 
-    output_path = output_path_for(args.output) if args.output else default_output_path(args.input)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    words, terms, names = read_jsonl(
-        args.input,
-        args.min_len,
-        args.max_len,
-        stopwords,
-        keepwords,
-        args.common_word_max,
-    )
-
-    word_entries = ranked(words, args.min_word_score, args.max_words)
-    term_entries = ranked(terms, args.min_term_score, args.max_terms)
-    name_entries = ranked(names, args.min_name_score, args.max_names)
-
-    seen = set()
-    base_entries = []
-    for entry in [*name_entries, *term_entries, *word_entries]:
-        if entry not in seen:
-            seen.add(entry)
-            base_entries.append(entry)
-        if len(base_entries) >= args.max_base:
-            break
-
-    count = write_list(output_path, base_entries)
-    print(f"wordlist: {count} -> {output_path}")
+    for input_path in inputs:
+        output_path = output_path_for(explicit_output) if explicit_output else default_output_path(input_path)
+        build_wordlist(args, input_path, output_path)
     return 0
 
 

@@ -23,7 +23,7 @@ def remove_artifact(path: Path) -> None:
 
 def ensure_wikiextractor() -> None:
     try:
-        import wikiextractor.WikiExtractor  # noqa: F401
+        import run_wikiextractor  # noqa: F401
     except ImportError as exc:
         raise RuntimeError("Missing dependency: wikiextractor. Run `uv sync` first.") from exc
 

@@ -1,5 +1,4 @@
-bs4>=0.0.1
 requests>=2.24.0
-argparse>=1.4.0
-webdriver-manager>=3.8.5
-selenium>=4.8.2
+tqdm>=4.67.3
+wikiextractor>=3.0.6
+wordfreq>=3.1.1

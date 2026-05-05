@@ -55,11 +55,25 @@ python3 ScrapeFandom.py jedipedia@de --no-cache
 python3 ScrapeFandom.py jedipedia@de --refresh-cache
 ```
 
+Export requests run with 4 parallel workers by default. This is usually much faster than the old sequential mode while still being conservative enough for Fandom. Increase workers carefully for very large wikis, and add an initial request delay if you see throttling:
+
+```sh
+uv run fandom-scrape jedipedia@de --workers 8
+uv run fandom-scrape jedipedia@de --workers 2 --request-delay 0.5
+```
+
+Transient `429`, `500`, `502`, `503`, and `504` responses are retried with exponential backoff. When one of those responses is seen, the scraper also increases a shared adaptive request delay for all export workers and slowly reduces it again after successful requests. `--max-request-delay` controls that adaptive ceiling:
+
+```sh
+uv run fandom-scrape jedipedia@de --workers 8 --max-request-delay 20
+```
+
 The same export-cache flags are available through the pipeline:
 
 ```sh
 uv run fandom-pipeline jedipedia@de --refresh-export-cache
 uv run fandom-pipeline jedipedia@de --no-export-cache
+uv run fandom-pipeline jedipedia@de --workers 8
 ```
 
 If you already have a scraped XML dump, convert it directly to JSONL:

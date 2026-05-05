@@ -1,7 +1,9 @@
 import argparse
+import concurrent.futures
 import hashlib
 import sys
 import tempfile
+import threading
 import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
@@ -18,6 +20,7 @@ XSI_NS = "http://www.w3.org/2001/XMLSchema-instance"
 XML_NS = "http://www.w3.org/XML/1998/namespace"
 DEFAULT_CACHE_DIR = Path(tempfile.gettempdir()) / "scrape-fandom" / "export-batches"
 RETRY_STATUSES = {429, 500, 502, 503, 504}
+THREAD_LOCAL = threading.local()
 
 
 ET.register_namespace("", MEDIAWIKI_NS)
@@ -70,6 +73,44 @@ def fetch_all_titles(session: requests.Session, fandom_site: str, language: str)
             return titles
         params.update(continuation)
 
+
+class AdaptiveThrottle:
+    def __init__(self, initial_delay: float, max_delay: float) -> None:
+        self.delay = initial_delay
+        self.initial_delay = initial_delay
+        self.max_delay = max_delay
+        self.lock = threading.Lock()
+
+    def wait(self) -> None:
+        with self.lock:
+            delay = self.delay
+        if delay > 0:
+            time.sleep(delay)
+
+    def success(self) -> None:
+        if self.max_delay <= 0:
+            return
+        with self.lock:
+            if self.delay > self.initial_delay:
+                self.delay = max(self.initial_delay, self.delay * 0.9)
+
+    def throttle(self) -> float:
+        if self.max_delay <= 0:
+            return 0.0
+        with self.lock:
+            self.delay = min(self.max_delay, max(0.25, self.delay * 2 if self.delay else 0.5))
+            return self.delay
+
+
+def worker_session() -> requests.Session:
+    session = getattr(THREAD_LOCAL, "session", None)
+    if session is None:
+        session = requests.Session()
+        session.headers.update({"User-Agent": USER_AGENT})
+        THREAD_LOCAL.session = session
+    return session
+
+
 def export_batch(
     session: requests.Session,
     fandom_site: str,
@@ -77,6 +118,7 @@ def export_batch(
     titles: list[str],
     retries: int,
     retry_delay: float,
+    throttle: AdaptiveThrottle | None = None,
 ) -> ET.Element:
     if len(titles) > 45:
         raise ValueError(f"Too many titles in one batch: {len(titles)}")
@@ -87,7 +129,7 @@ def export_batch(
     url = api_url(fandom_site, language)
 
     headers = {
-        "User-Agent": "YourProjectName/1.0 contact@example.com",
+        "User-Agent": USER_AGENT,
         "Accept": "application/xml,text/xml,*/*",
     }
 
@@ -100,15 +142,21 @@ def export_batch(
     }
 
     for attempt in range(retries + 1):
+        if throttle is not None:
+            throttle.wait()
         response = session.get(url, params=params, headers=headers, timeout=120)
         if response.status_code not in RETRY_STATUSES:
             response.raise_for_status()
+            if throttle is not None:
+                throttle.success()
             break
         if attempt >= retries:
             response.raise_for_status()
+        throttle_delay = throttle.throttle() if throttle is not None else 0.0
         sleep_for = retry_delay * (2**attempt)
         print(
-            f"Export batch got HTTP {response.status_code}; retrying in {sleep_for:.1f}s",
+            f"Export batch got HTTP {response.status_code}; retrying in {sleep_for:.1f}s"
+            + (f" (adaptive delay now {throttle_delay:.1f}s)" if throttle_delay else ""),
             file=sys.stderr,
         )
         time.sleep(sleep_for)
@@ -183,7 +231,6 @@ def write_root_start(outfile, root: ET.Element) -> None:
 
 
 def write_dump(
-    session: requests.Session,
     output_name: str,
     fandom_site: str,
     language: str,
@@ -193,37 +240,53 @@ def write_dump(
     refresh_cache: bool,
     retries: int,
     retry_delay: float,
+    workers: int,
+    request_delay: float,
+    max_request_delay: float,
 ) -> None:
     batches = list(batched(titles, batch_size))
     wrote_header = False
     output_path = Path(f"{output_name}.xml")
     tmp_output_path = output_path.with_suffix(output_path.suffix + ".tmp")
     namespace = cache_namespace(output_name, fandom_site, language, batch_size)
+    throttle = AdaptiveThrottle(request_delay, max_request_delay)
+
+    def load_batch(title_batch: list[str]) -> ET.Element:
+        cache_path = cache_path_for(cache_dir, namespace, title_batch) if cache_dir else None
+        root = None if refresh_cache or cache_path is None else read_cached_batch(cache_path)
+        if root is not None:
+            return root
+
+        root = export_batch(
+            worker_session(),
+            fandom_site,
+            language,
+            title_batch,
+            retries,
+            retry_delay,
+            throttle,
+        )
+        if cache_path is not None:
+            write_cached_batch(cache_path, root)
+        return root
 
     with tmp_output_path.open("w", encoding="utf-8") as outfile:
         outfile.write('<?xml version="1.0" encoding="utf-8"?>\n')
 
-        for title_batch in tqdm(batches, desc=f"Exporting {output_name}"):
-            cache_path = cache_path_for(cache_dir, namespace, title_batch) if cache_dir else None
-            root = None if refresh_cache or cache_path is None else read_cached_batch(cache_path)
-            if root is None:
-                root = export_batch(session, fandom_site, language, title_batch, retries, retry_delay)
-                if cache_path is not None:
-                    write_cached_batch(cache_path, root)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=workers) as executor:
+            roots = executor.map(load_batch, batches)
+            for root in tqdm(roots, total=len(batches), desc=f"Exporting {output_name}"):
+                if not wrote_header:
+                    write_root_start(outfile, root)
+                    siteinfo = root.find(f"{{{MEDIAWIKI_NS}}}siteinfo")
+                    if siteinfo is not None:
+                        outfile.write(ET.tostring(siteinfo, encoding="unicode"))
+                        outfile.write("\n")
+                    wrote_header = True
 
-            if not wrote_header:
-                write_root_start(outfile, root)
-                siteinfo = root.find(f"{{{MEDIAWIKI_NS}}}siteinfo")
-                if siteinfo is not None:
-                    outfile.write(ET.tostring(siteinfo, encoding="unicode"))
+                for page in root.findall(f"{{{MEDIAWIKI_NS}}}page"):
+                    outfile.write(ET.tostring(page, encoding="unicode"))
                     outfile.write("\n")
-                wrote_header = True
-
-            for page in root.findall(f"{{{MEDIAWIKI_NS}}}page"):
-                outfile.write(ET.tostring(page, encoding="unicode"))
-                outfile.write("\n")
-
-            time.sleep(0.1)
 
         if not wrote_header:
             raise RuntimeError(f"No pages found for {output_name}")
@@ -238,7 +301,6 @@ def scrape_target(args: argparse.Namespace, session: requests.Session, target: s
     if not titles:
         raise RuntimeError(f"No pages found for {target}")
     write_dump(
-        session,
         target,
         fandom_site,
         language,
@@ -248,6 +310,9 @@ def scrape_target(args: argparse.Namespace, session: requests.Session, target: s
         args.refresh_cache,
         args.retries,
         args.retry_delay,
+        args.workers,
+        args.request_delay,
+        args.max_request_delay,
     )
     print(f"Wrote {target}.xml with {len(titles)} pages")
 
@@ -256,6 +321,14 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("input_fandom", nargs="+", help="Fandom site name(s), e.g. harrypotter or harry-potter@de")
     parser.add_argument("--batch-size", type=int, default=30, help="Number of pages per export API request")
+    parser.add_argument("--workers", type=int, default=4, help="Parallel export workers")
+    parser.add_argument("--request-delay", type=float, default=0.0, help="Initial per-request delay for export workers")
+    parser.add_argument(
+        "--max-request-delay",
+        type=float,
+        default=10.0,
+        help="Maximum adaptive per-request delay after throttling responses; 0 disables adaptive delay",
+    )
     parser.add_argument(
         "--cache-dir",
         type=Path,
@@ -270,6 +343,10 @@ def main() -> int:
 
     if args.batch_size < 1:
         parser.error("--batch-size must be at least 1")
+    if args.workers < 1:
+        parser.error("--workers must be at least 1")
+    if args.request_delay < 0 or args.max_request_delay < 0:
+        parser.error("request delays must not be negative")
     if args.retries < 0:
         parser.error("--retries must not be negative")
     if args.retry_delay < 0:

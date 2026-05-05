@@ -16,6 +16,7 @@ except ImportError:
 
 TOKEN_RE = re.compile(r"[^\W_]+(?:['-][^\W_]+)*", re.UNICODE)
 CAPITALIZED_RE = re.compile(r"\b[^\W_\d][^\W_]*(?:['-][^\W_]+)?\b", re.UNICODE)
+ASCII_DIGITS_RE = re.compile(r"^[0-9]+$")
 DEFAULT_EXCLUDE_FILES = [
     Path("dictionaries/common-english.txt"),
     Path("dictionaries/common-german.txt"),
@@ -128,7 +129,7 @@ def is_candidate(
         return False
     if max_zipf is not None and is_common_word(token, max_zipf, keepwords):
         return False
-    if token.isdigit():
+    if ASCII_DIGITS_RE.fullmatch(token):
         return 1900 <= int(token) <= 2099
     if sum(char.isalpha() for char in token) < min_len:
         return False

@@ -38,6 +38,12 @@ def process_target(target: str, args: argparse.Namespace) -> None:
         scrape_command = [sys.executable, "ScrapeFandom.py", target]
         if args.batch_size is not None:
             scrape_command.extend(["--batch-size", str(args.batch_size)])
+        if args.workers is not None:
+            scrape_command.extend(["--workers", str(args.workers)])
+        if args.request_delay is not None:
+            scrape_command.extend(["--request-delay", str(args.request_delay)])
+        if args.max_request_delay is not None:
+            scrape_command.extend(["--max-request-delay", str(args.max_request_delay)])
         if args.no_export_cache:
             scrape_command.append("--no-cache")
         if args.refresh_export_cache:
@@ -80,6 +86,9 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Scrape Fandom wikis and generate JSONL plus wordlists.")
     parser.add_argument("targets", nargs="+", help="Fandom target(s), e.g. pokemon@de harrypotter")
     parser.add_argument("--batch-size", type=int, help="Pages per export API batch")
+    parser.add_argument("--workers", type=int, help="Parallel export workers")
+    parser.add_argument("--request-delay", type=float, help="Initial per-request delay for export workers")
+    parser.add_argument("--max-request-delay", type=float, help="Maximum adaptive per-request delay after throttling")
     parser.add_argument("--max-base", type=int, help="Maximum entries in generated wordlist")
     parser.add_argument("--skip-scrape", action="store_true", help="Reuse an existing <target>.xml")
     parser.add_argument("--skip-extract", action="store_true", help="Reuse an existing WikiExtractor directory")

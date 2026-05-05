@@ -1,8 +1,10 @@
 import re
 import sys
+import warnings
 
 
 real_compile = re.compile
+warnings.filterwarnings("ignore", category=SyntaxWarning, module=r"wikiextractor\..*")
 
 
 def compile_compatible(pattern, flags=0):
@@ -10,11 +12,7 @@ def compile_compatible(pattern, flags=0):
         return real_compile(pattern, flags)
     except re.PatternError as exc:
         if isinstance(pattern, str) and "(?i)" in pattern and "global flags" in str(exc):
-            pattern = pattern.replace("(((?i)", "(((?i:")
-            pattern = pattern.replace("((?i)", "((?i:")
-            pattern = pattern.replace(r')[^][<>"\x00-\x20\x7F\s]', r'))[^][<>"\x00-\x20\x7F\s]', 1)
-            pattern = pattern.replace("jpeg)$", "jpeg))$")
-            return real_compile(pattern, flags)
+            return real_compile(pattern.replace("(?i)", ""), flags | re.IGNORECASE)
         raise
 
 

@@ -2,6 +2,11 @@ import argparse
 import json
 import os
 import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
 
 from tqdm import tqdm
 
@@ -39,14 +44,56 @@ def convert_json_dir(input_dir: str, output: str) -> int:
     return counter
 
 
+def extract_xml_to_json_dir(xml_path: Path, output_dir: Path) -> None:
+    subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "run_wikiextractor",
+            str(xml_path),
+            "--no-templates",
+            "-l",
+            "--json",
+            "-o",
+            str(output_dir),
+        ],
+        check=True,
+    )
+
+
+def convert_input(input_path: Path, output_path: Path, keep_extracted: bool) -> int:
+    if input_path.suffix != ".xml":
+        return convert_json_dir(str(input_path), str(output_path))
+
+    if keep_extracted:
+        extract_dir = output_path.with_suffix("")
+        if extract_dir.exists():
+            shutil.rmtree(extract_dir)
+        cleanup_dir = False
+    else:
+        extract_dir = Path(tempfile.mkdtemp(prefix=f"{input_path.stem}-", dir="/tmp"))
+        cleanup_dir = True
+
+    extract_xml_to_json_dir(input_path, extract_dir)
+    try:
+        return convert_json_dir(str(extract_dir), str(output_path))
+    finally:
+        if cleanup_dir:
+            shutil.rmtree(extract_dir)
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Convert WikiExtractor JSON output to one JSONL corpus.")
-    parser.add_argument("input_dir", help="Directory with wiki json files")
-    parser.add_argument("output", help="JSONL output path")
+    parser = argparse.ArgumentParser(description="Convert WikiExtractor JSON output or a MediaWiki XML dump to one JSONL corpus.")
+    parser.add_argument("input", type=Path, help="WikiExtractor output directory or MediaWiki XML dump")
+    parser.add_argument("output", type=Path, help="JSONL output path")
+    parser.add_argument("--keep-extracted", action="store_true", help="Keep extracted JSON directory when input is XML")
     args = parser.parse_args()
 
-    print(convert_json_dir(args.input_dir, args.output))
-    return 0
+    try:
+        print(convert_input(args.input, args.output, args.keep_extracted))
+        return 0
+    except subprocess.CalledProcessError as exc:
+        return exc.returncode
 
 
 if __name__ == "__main__":

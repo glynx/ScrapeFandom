@@ -104,7 +104,7 @@ def collect_title_keepwords(path: Path, min_title_count: int, stopwords: set[str
             if not line.strip():
                 continue
             title, _ = split_title(json.loads(line).get("text", ""))
-            counts.update(token for token in set(tokens_from(title)) if token and token not in DOMAIN_STOPWORDS)
+            counts.update(token for token in set(tokens_from(title)) if token and token not in STOPWORDS)
     return {token for token, count in counts.items() if count >= min_title_count}
 
 
@@ -283,7 +283,13 @@ def read_jsonl(
 def ranked(counter: Counter[str], min_score: int, limit: int) -> list[str]:
     items = [(term, score) for term, score in counter.items() if score >= min_score]
     items.sort(key=lambda item: (-item[1], len(item[0]), item[0].lower()))
-    return [term for term, _ in items[:limit]]
+    if limit > 0:
+        items = items[:limit]
+    return [term for term, _ in items]
+
+
+def scored_count(counter: Counter[str], min_score: int) -> int:
+    return sum(1 for score in counter.values() if score >= min_score)
 
 
 def write_list(path: Path, entries: Iterable[str]) -> int:
@@ -336,17 +342,33 @@ def build_wordlist(args: argparse.Namespace, input_path: Path, output_path: Path
     word_entries = ranked(words, args.min_word_score, args.max_words)
     term_entries = ranked(terms, args.min_term_score, args.max_terms)
     name_entries = ranked(names, args.min_name_score, args.max_names)
+    title_counter = Counter(
+        {
+            word: words.get(word, 0) + terms.get(word, 0) + names.get(word, 0)
+            for word in keepwords
+            if word in words or word in terms or word in names
+        }
+    )
+    title_entries = ranked(title_counter, 1, 0)
 
     seen = set()
     base_entries = []
-    for entry in [*name_entries, *term_entries, *word_entries]:
+    for entry in [*title_entries, *name_entries, *term_entries, *word_entries]:
         if entry not in seen:
             seen.add(entry)
             base_entries.append(entry)
-        if len(base_entries) >= args.max_base:
+        if args.max_base > 0 and len(base_entries) >= args.max_base:
             break
 
     count = write_list(output_path, base_entries)
+    print(
+        "stats: "
+        f"titles={len(title_entries)}/{len(keepwords)} "
+        f"names={len(name_entries)}/{scored_count(names, args.min_name_score)} "
+        f"terms={len(term_entries)}/{scored_count(terms, args.min_term_score)} "
+        f"words={len(word_entries)}/{scored_count(words, args.min_word_score)} "
+        f"max-base={args.max_base or 'unlimited'}"
+    )
     print(f"wordlist: {count} -> {output_path}")
     return count
 
@@ -386,23 +408,25 @@ def main() -> int:
     parser.add_argument(
         "--common-word-max",
         type=float,
-        default=4.3,
+        default=5.2,
         help="Suppress single words this common or more in English/German, using wordfreq if installed.",
     )
     parser.add_argument(
         "--title-keep-score",
         type=int,
-        default=2,
+        default=1,
         help="Keep words that appear in at least this many page titles, even if common.",
     )
-    parser.add_argument("--max-words", type=int, default=50000)
-    parser.add_argument("--max-terms", type=int, default=200000)
-    parser.add_argument("--max-names", type=int, default=100000)
-    parser.add_argument("--max-base", type=int, default=250000)
+    parser.add_argument("--max-words", type=int, default=0, help="Cap ranked single-word entries. 0 disables this cap.")
+    parser.add_argument("--max-terms", type=int, default=0, help="Cap ranked multi-word/phrase entries. 0 disables this cap.")
+    parser.add_argument("--max-names", type=int, default=0, help="Cap ranked capitalized/name entries. 0 disables this cap.")
+    parser.add_argument("--max-base", type=int, default=0, help="Cap final unique output entries. 0 disables this cap.")
     args = parser.parse_args()
 
     if args.min_len < 1 or args.max_len < args.min_len:
         parser.error("length bounds are invalid")
+    if min(args.max_words, args.max_terms, args.max_names, args.max_base) < 0:
+        parser.error("max limits must be 0 or greater")
     if zipf_frequency is None and args.common_word_max is not None:
         print("wordfreq is not installed; falling back to built-in stopword filtering only")
 

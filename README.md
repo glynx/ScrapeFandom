@@ -62,6 +62,14 @@ uv run fandom-pipeline jedipedia@de --refresh-export-cache
 uv run fandom-pipeline jedipedia@de --no-export-cache
 ```
 
+If you already have a scraped XML dump, convert it directly to JSONL:
+
+```sh
+uv run fandom-jsonl jedipedia@de.xml jedipedia@de.jsonl
+```
+
+This uses a temporary WikiExtractor directory and removes it afterwards. Add `--keep-extracted` if you want to keep that intermediate directory.
+
 # Wiki Discovery
 List candidate Fandom wikis with the argument to pass to `run-me.sh`:
 
@@ -116,15 +124,36 @@ uv run fandom-wordlist actors@de.jsonl call-of-duty@de.jsonl
 
 The default output path is derived from each input file. For example, `pokemon@de.jsonl` writes `wordlists/pokemon_de.txt`, and `call-of-duty@de.jsonl` writes `wordlists/call-of-duty_de.txt`.
 
-The default cap is 250,000 entries. Lower it for a tighter seed list:
+By default, the extractor does not cap the number of emitted entries. It keeps every candidate that passes the score, length, dictionary, and common-word filters. This is intentional for cracking seed lists because large wikis often contain low-frequency domain terms that are still valuable.
+
+Use caps when you need a smaller, faster list:
 
 ```sh
 uv run fandom-wordlist harrypotter.jsonl wordlists/harrypotter-small.txt --max-base 50000
 ```
 
+The limit flags are:
+
+```text
+--max-base   final unique output entries
+--max-words  ranked single-word entries before merging
+--max-terms  ranked multi-word/phrase entries before merging
+--max-names  ranked capitalized/name entries before merging
+```
+
+All of these default to `0`, which means unlimited. Prefer `--max-base` for a simple final-size limit. The bucket-specific limits are mainly useful when you want to bias the list toward or away from phrases, names, or single words.
+
+The command prints a stats line before the final output path:
+
+```text
+stats: titles=376/431 names=1488/1488 terms=10178/10178 words=8750/8750 max-base=unlimited
+```
+
+For each bucket, the first number is what was selected after caps and the second number is what passed scoring. If both numbers are equal, caps are not reducing the output; dictionary, stopword, length, score, or common-word filters are responsible for the final size.
+
 Multi-word terms are emitted as combinations and as their component words. For example, an accepted term like `Harry Potter` can produce entries such as `harry`, `potter`, `harrypotter`, `HarryPotter`, `harry-potter`, and `harry_potter`.
 
-By default, the extractor excludes common English and German terms using the vendored lists in `dictionaries/`:
+By default, the extractor is biased toward domain coverage. Any word that appears in a page title is kept, and the `wordfreq` common-word filter only suppresses very common English/German words (`--common-word-max 5.2`). Generic filler is still excluded with the vendored lists in `dictionaries/`:
 
 ```text
 dictionaries/common-english.txt
@@ -144,4 +173,16 @@ If a wiki has domain terms that look like common words, keep them explicitly:
 ```sh
 uv run fandom-wordlist harrypotter.jsonl wordlists/harrypotter \
   --keep-file dictionaries/harrypotter.keep.txt
+```
+
+For an even broader list, raise or effectively disable the `wordfreq` filter:
+
+```sh
+uv run fandom-wordlist jedipedia@de.jsonl --common-word-max 999
+```
+
+To also disable the vendored common-word dictionaries:
+
+```sh
+uv run fandom-wordlist jedipedia@de.jsonl --no-default-excludes --common-word-max 999
 ```

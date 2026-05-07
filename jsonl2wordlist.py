@@ -1,12 +1,33 @@
 import argparse
+import hashlib
 import json
 import re
+import tempfile
 import unicodedata
 from collections import Counter
+from functools import lru_cache
 from pathlib import Path
 from typing import Iterable
 
 from tqdm import tqdm
+
+try:
+    from rich.progress import (
+        BarColumn,
+        DownloadColumn,
+        Progress,
+        TextColumn,
+        TimeElapsedColumn,
+        TimeRemainingColumn,
+        TransferSpeedColumn,
+    )
+except ImportError:
+    Progress = None
+
+try:
+    import orjson
+except ImportError:
+    orjson = None
 
 try:
     from wordfreq import zipf_frequency
@@ -21,6 +42,9 @@ DEFAULT_EXCLUDE_FILES = [
     Path("dictionaries/common-english.txt"),
     Path("dictionaries/common-german.txt"),
 ]
+DEFAULT_WORDLIST_CACHE_DIR = Path(tempfile.gettempdir()) / "scrape-fandom" / "wordlist-cache"
+LARGE_INPUT_BYTES = 512 * 1024 * 1024
+HUGE_INPUT_BYTES = 1024 * 1024 * 1024
 
 EN_STOPWORDS = {
     "a", "about", "above", "after", "again", "against", "all", "almost", "also", "although",
@@ -98,21 +122,105 @@ def load_word_file(path: Path) -> set[str]:
     return words
 
 
+def iter_jsonl_lines(path: Path, description: str) -> Iterable[bytes]:
+    total = path.stat().st_size
+    if Progress is not None:
+        with Progress(
+            TextColumn("[progress.description]{task.description}"),
+            BarColumn(),
+            DownloadColumn(binary_units=True),
+            TransferSpeedColumn(),
+            TimeElapsedColumn(),
+            TimeRemainingColumn(),
+        ) as progress:
+            task = progress.add_task(description, total=total)
+            with path.open("rb") as infile:
+                for line in infile:
+                    progress.update(task, advance=len(line))
+                    yield line
+        return
+
+    with path.open("rb") as infile:
+        with tqdm(total=total, desc=description, unit="B", unit_scale=True, unit_divisor=1024) as progress:
+            for line in infile:
+                progress.update(len(line))
+                yield line
+
+
+def json_line_text(line: bytes | str) -> str:
+    if orjson is not None:
+        return orjson.loads(line).get("text", "")
+    return json.loads(line).get("text", "")
+
+
+def title_cache_key(path: Path, min_title_count: int, stopwords: set[str]) -> str:
+    stat = path.stat()
+    stopword_digest = hashlib.sha256("\n".join(sorted(stopwords)).encode("utf-8")).hexdigest()[:16]
+    key = f"{path.resolve()}\0{stat.st_size}\0{stat.st_mtime_ns}\0{min_title_count}\0{stopword_digest}"
+    return hashlib.sha256(key.encode("utf-8")).hexdigest()
+
+
+def title_keepword_cache_path(cache_dir: Path, path: Path, min_title_count: int, stopwords: set[str]) -> Path:
+    return cache_dir / f"{path.stem}-{title_cache_key(path, min_title_count, stopwords)}.json"
+
+
+def read_cached_keepwords(path: Path) -> set[str] | None:
+    if not path.exists():
+        return None
+    try:
+        with path.open(encoding="utf-8") as infile:
+            data = json.load(infile)
+    except (OSError, json.JSONDecodeError):
+        return None
+    keepwords = data.get("keepwords") if isinstance(data, dict) else None
+    if not isinstance(keepwords, list) or not all(isinstance(word, str) for word in keepwords):
+        return None
+    return set(keepwords)
+
+
+def write_cached_keepwords(path: Path, keepwords: set[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as outfile:
+        json.dump({"keepwords": sorted(keepwords)}, outfile, ensure_ascii=False)
+    tmp_path.replace(path)
+
+
 def collect_title_keepwords(path: Path, min_title_count: int, stopwords: set[str]) -> set[str]:
     counts: Counter[str] = Counter()
-    with path.open(encoding="utf-8") as infile:
-        for line in infile:
-            if not line.strip():
-                continue
-            title, _ = split_title(json.loads(line).get("text", ""))
-            counts.update(token for token in set(tokens_from(title)) if token and token not in STOPWORDS)
+    for line in iter_jsonl_lines(path, f"Scanning titles {path.name}"):
+        if not line.strip():
+            continue
+        title, _ = split_title(json_line_text(line))
+        counts.update(token for token in set(tokens_from(title)) if token and token not in STOPWORDS)
     return {token for token, count in counts.items() if count >= min_title_count}
 
 
-def is_common_word(token: str, max_zipf: float, keepwords: set[str]) -> bool:
-    if zipf_frequency is None or token in keepwords or not token.isalpha():
+def load_title_keepwords(path: Path, min_title_count: int, stopwords: set[str], cache_dir: Path | None, refresh: bool) -> set[str]:
+    cache_path = title_keepword_cache_path(cache_dir, path, min_title_count, stopwords) if cache_dir else None
+    if cache_path is not None and not refresh:
+        keepwords = read_cached_keepwords(cache_path)
+        if keepwords is not None:
+            print(f"Loaded {len(keepwords)} cached title keepwords for {path.name}")
+            return keepwords
+
+    keepwords = collect_title_keepwords(path, min_title_count, stopwords)
+    if cache_path is not None:
+        write_cached_keepwords(cache_path, keepwords)
+    return keepwords
+
+
+@lru_cache(maxsize=200_000)
+def cached_common_word(token: str, max_zipf: float) -> bool:
+    if zipf_frequency is None or not token.isalpha():
         return False
     return max(zipf_frequency(token, "en"), zipf_frequency(token, "de")) >= max_zipf
+
+
+def is_common_word(token: str, max_zipf: float, keepwords: set[str]) -> bool:
+    if token in keepwords:
+        return False
+    return cached_common_word(token, max_zipf)
 
 
 def is_candidate(
@@ -163,6 +271,8 @@ def phrase_variants(words: Iterable[str]) -> list[str]:
 
 
 def compact_variants(term: str) -> list[str]:
+    if term.isascii():
+        return [term]
     variants = [term]
     folded = ascii_fold(term)
     if folded and folded != term and folded not in variants:
@@ -244,33 +354,35 @@ def read_jsonl(
     stopwords: set[str],
     keepwords: set[str],
     common_word_max: float | None,
+    body_phrases: bool,
+    body_names: bool,
 ) -> tuple[Counter[str], Counter[str], Counter[str]]:
     words: Counter[str] = Counter()
     terms: Counter[str] = Counter()
     names: Counter[str] = Counter()
 
-    with path.open(encoding="utf-8") as infile:
-        for line in tqdm(infile, desc=f"Reading {path.name}"):
-            if not line.strip():
-                continue
-            data = json.loads(line)
-            title, body = split_title(data.get("text", ""))
-            title_tokens = tokens_from(title)
-            body_tokens = tokens_from(body)
+    for line in iter_jsonl_lines(path, f"Reading {path.name}"):
+        if not line.strip():
+            continue
+        title, body = split_title(json_line_text(line))
+        title_tokens = tokens_from(title)
+        body_tokens = tokens_from(body)
 
-            for token in title_tokens:
-                add_term(words, token, 8, min_len, max_len, stopwords, keepwords, common_word_max)
-            for token in body_tokens:
-                add_term(words, token, 1, min_len, max_len, stopwords, keepwords, common_word_max)
+        for token in title_tokens:
+            add_term(words, token, 8, min_len, max_len, stopwords, keepwords, common_word_max)
+        for token in body_tokens:
+            add_term(words, token, 1, min_len, max_len, stopwords, keepwords, common_word_max)
 
-            add_phrases(terms, words, title_tokens, 12, min_len, max_len, stopwords, keepwords, common_word_max)
+        add_phrases(terms, words, title_tokens, 12, min_len, max_len, stopwords, keepwords, common_word_max)
+        if body_phrases:
             add_phrases(terms, words, body_tokens, 1, min_len, max_len, stopwords, keepwords, common_word_max)
 
-            for capitalized in collect_capitalized_terms(title, stopwords, keepwords):
-                add_phrase_components(names, capitalized[:4], 12, min_len, max_len, stopwords, keepwords)
-                add_phrase_components(words, capitalized[:4], 12, min_len, max_len, stopwords, keepwords)
-                for phrase in phrase_variants(capitalized[:4]):
-                    add_term(names, phrase, 12, min_len, max_len, stopwords, keepwords)
+        for capitalized in collect_capitalized_terms(title, stopwords, keepwords):
+            add_phrase_components(names, capitalized[:4], 12, min_len, max_len, stopwords, keepwords)
+            add_phrase_components(words, capitalized[:4], 12, min_len, max_len, stopwords, keepwords)
+            for phrase in phrase_variants(capitalized[:4]):
+                add_term(names, phrase, 12, min_len, max_len, stopwords, keepwords)
+        if body_names:
             for capitalized in collect_capitalized_terms(body, stopwords, keepwords):
                 if len(capitalized) <= 5:
                     add_phrase_components(names, capitalized[:4], 2, min_len, max_len, stopwords, keepwords)
@@ -318,6 +430,8 @@ def default_output_path(input_path: Path) -> Path:
 
 
 def build_wordlist(args: argparse.Namespace, input_path: Path, output_path: Path) -> int:
+    input_size = input_path.stat().st_size
+    body_phrases, body_names, common_word_filter, mode_notes = extraction_plan(args, input_size)
     stopwords = set(STOPWORDS)
     keepwords = set()
     if not args.no_default_excludes:
@@ -326,7 +440,15 @@ def build_wordlist(args: argparse.Namespace, input_path: Path, output_path: Path
                 stopwords.update(load_word_file(path))
     for path in args.exclude_file:
         stopwords.update(load_word_file(path))
-    keepwords.update(collect_title_keepwords(input_path, args.title_keep_score, stopwords))
+    keepwords.update(
+        load_title_keepwords(
+            input_path,
+            args.title_keep_score,
+            stopwords,
+            None if args.no_wordlist_cache else args.wordlist_cache_dir,
+            args.refresh_wordlist_cache,
+        )
+    )
     for path in args.keep_file:
         keepwords.update(load_word_file(path))
 
@@ -337,7 +459,9 @@ def build_wordlist(args: argparse.Namespace, input_path: Path, output_path: Path
         args.max_len,
         stopwords,
         keepwords,
-        args.common_word_max,
+        args.common_word_max if common_word_filter else None,
+        body_phrases,
+        body_names,
     )
 
     word_entries = ranked(words, args.min_word_score, args.max_words)
@@ -362,16 +486,52 @@ def build_wordlist(args: argparse.Namespace, input_path: Path, output_path: Path
             break
 
     count = write_list(output_path, base_entries)
+    common_cache = cached_common_word.cache_info()
     print(
         "stats: "
+        f"mode={','.join(mode_notes)} "
         f"titles={len(title_entries)}/{len(keepwords)} "
         f"names={len(name_entries)}/{scored_count(names, args.min_name_score)} "
         f"terms={len(term_entries)}/{scored_count(terms, args.min_term_score)} "
         f"words={len(word_entries)}/{scored_count(words, args.min_word_score)} "
-        f"max-base={args.max_base or 'unlimited'}"
+        f"max-base={args.max_base or 'unlimited'} "
+        f"common-cache={common_cache.hits}/{common_cache.misses}"
     )
     print(f"wordlist: {count} -> {output_path}")
     return count
+
+
+def extraction_plan(args: argparse.Namespace, input_size: int) -> tuple[bool, bool, bool, list[str]]:
+    body_phrases = args.body_phrases
+    body_names = args.body_names
+    common_word_filter = args.common_word_filter
+    notes = ["full"]
+
+    if args.auto_tune and input_size >= LARGE_INPUT_BYTES:
+        notes = ["auto-large"]
+        if body_phrases is None:
+            body_phrases = False
+        if input_size >= HUGE_INPUT_BYTES:
+            notes = ["auto-huge"]
+            if body_names is None:
+                body_names = False
+            if common_word_filter is None:
+                common_word_filter = False
+
+    if body_phrases is None:
+        body_phrases = True
+    if body_names is None:
+        body_names = True
+    if common_word_filter is None:
+        common_word_filter = True
+
+    if not body_phrases:
+        notes.append("no-body-phrases")
+    if not body_names:
+        notes.append("no-body-names")
+    if not common_word_filter:
+        notes.append("no-common-word-filter")
+    return body_phrases, body_names, common_word_filter, notes
 
 
 def main() -> int:
@@ -412,6 +572,20 @@ def main() -> int:
         default=5.2,
         help="Suppress single words this common or more in English/German, using wordfreq if installed.",
     )
+    common_group = parser.add_mutually_exclusive_group()
+    common_group.add_argument("--common-word-filter", dest="common_word_filter", action="store_true", help="Force-enable wordfreq filtering")
+    common_group.add_argument("--no-common-word-filter", dest="common_word_filter", action="store_false", help="Disable wordfreq lookups for faster runs")
+    parser.set_defaults(common_word_filter=None)
+    phrases_group = parser.add_mutually_exclusive_group()
+    phrases_group.add_argument("--body-phrases", dest="body_phrases", action="store_true", help="Force-enable 2/3-word phrase variants from article bodies")
+    phrases_group.add_argument("--no-body-phrases", dest="body_phrases", action="store_false", help="Do not generate 2/3-word phrase variants from article bodies")
+    parser.set_defaults(body_phrases=None)
+    names_group = parser.add_mutually_exclusive_group()
+    names_group.add_argument("--body-names", dest="body_names", action="store_true", help="Force-enable capitalized name variants from article bodies")
+    names_group.add_argument("--no-body-names", dest="body_names", action="store_false", help="Do not generate capitalized name variants from article bodies")
+    parser.set_defaults(body_names=None)
+    parser.add_argument("--no-auto-tune", dest="auto_tune", action="store_false", help="Disable automatic large-input resource tuning")
+    parser.set_defaults(auto_tune=True)
     parser.add_argument(
         "--title-keep-score",
         type=int,
@@ -422,13 +596,21 @@ def main() -> int:
     parser.add_argument("--max-terms", type=int, default=0, help="Cap ranked multi-word/phrase entries. 0 disables this cap.")
     parser.add_argument("--max-names", type=int, default=0, help="Cap ranked capitalized/name entries. 0 disables this cap.")
     parser.add_argument("--max-base", type=int, default=0, help="Cap final unique output entries. 0 disables this cap.")
+    parser.add_argument(
+        "--wordlist-cache-dir",
+        type=Path,
+        default=DEFAULT_WORDLIST_CACHE_DIR,
+        help=f"Directory for cached title keepwords (default: {DEFAULT_WORDLIST_CACHE_DIR})",
+    )
+    parser.add_argument("--no-wordlist-cache", action="store_true", help="Disable wordlist helper caches")
+    parser.add_argument("--refresh-wordlist-cache", action="store_true", help="Rebuild cached title keepwords")
     args = parser.parse_args()
 
     if args.min_len < 1 or args.max_len < args.min_len:
         parser.error("length bounds are invalid")
     if min(args.max_words, args.max_terms, args.max_names, args.max_base) < 0:
         parser.error("max limits must be 0 or greater")
-    if zipf_frequency is None and args.common_word_max is not None:
+    if zipf_frequency is None and args.common_word_max is not None and args.common_word_filter is not False:
         print("wordfreq is not installed; falling back to built-in stopword filtering only")
 
     inputs = args.paths

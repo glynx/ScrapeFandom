@@ -46,7 +46,7 @@ uv run fandom-pipeline pokemon@de --keep-artifacts
 ./run-me.sh pokemon@de
 ```
 
-Scrape exports are cached per API batch in `/tmp/scrape-fandom/export-batches` by default. These files can grow large, so they are kept out of the home-directory cache. If Fandom returns a temporary `502` or similar error, rerun the same command and already exported batches will be reused as long as `/tmp` has not been cleaned:
+Scrape title lists and exports are cached in `/tmp/scrape-fandom/export-batches` by default. These files can grow large, so they are kept out of the home-directory cache. If Fandom returns a temporary `502` or similar error, rerun the same command and already discovered page titles plus exported batches will be reused as long as `/tmp` has not been cleaned:
 
 ```sh
 python3 ScrapeFandom.py jedipedia@de
@@ -160,10 +160,47 @@ All of these default to `0`, which means unlimited. Prefer `--max-base` for a si
 The command prints a stats line before the final output path:
 
 ```text
-stats: titles=376/431 names=1488/1488 terms=10178/10178 words=8750/8750 max-base=unlimited
+stats: titles=376/431 names=1488/1488 terms=10178/10178 words=8750/8750 max-base=unlimited common-cache=123456/7890
 ```
 
 For each bucket, the first number is what was selected after caps and the second number is what passed scoring. If both numbers are equal, caps are not reducing the output; dictionary, stopword, length, score, or common-word filters are responsible for the final size.
+
+For large JSONL files, title keepwords are cached in `/tmp/scrape-fandom/wordlist-cache` by default. This avoids a full extra JSONL scan on repeated runs. The cache key includes the JSONL path, size, modification time, title score threshold, and active stopwords:
+
+```sh
+uv run fandom-wordlist jedipedia@de.jsonl --refresh-wordlist-cache
+uv run fandom-wordlist jedipedia@de.jsonl --no-wordlist-cache
+```
+
+The extractor also caches expensive `wordfreq` lookups in memory during a run. If `orjson` is installed, it is used automatically for faster JSONL parsing.
+
+JSONL scans use byte-based Rich progress bars, so large files show real progress, throughput, elapsed time, and estimated remaining time for both the title scan and the main read phase. If Rich is unavailable, the command falls back to a byte-based `tqdm` progress bar.
+
+For very large JSONL files, article-body phrase and name extraction can dominate CPU and RAM because it creates many unique 2/3-word combinations. The extractor auto-tunes by file size:
+
+```text
+< 512 MiB  full extraction
+>= 512 MiB skip article-body phrase variants
+>= 1 GiB   also skip article-body name variants and wordfreq lookups
+```
+
+Auto-tuning still keeps page-title phrases and single body words. You can override the automatic plan:
+
+```sh
+uv run fandom-wordlist military-history.jsonl \
+  --no-body-phrases \
+  --no-body-names \
+  --no-common-word-filter
+
+uv run fandom-wordlist military-history.jsonl \
+  --body-phrases \
+  --body-names \
+  --common-word-filter
+
+uv run fandom-wordlist military-history.jsonl --no-auto-tune
+```
+
+The stats line includes the selected mode, for example `mode=auto-huge,no-body-phrases,no-body-names,no-common-word-filter`.
 
 Multi-word terms are emitted as combinations and as their component words. For example, an accepted term like `Harry Potter` can produce entries such as `harry`, `potter`, `harrypotter`, `HarryPotter`, `harry-potter`, and `harry_potter`.
 

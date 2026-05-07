@@ -1,6 +1,7 @@
 import argparse
 import concurrent.futures
 import hashlib
+import json
 import sys
 import tempfile
 import threading
@@ -47,7 +48,13 @@ def api_url(fandom_site: str, language: str = "en") -> str:
     return f"https://{fandom_site}.fandom.com/{language}/api.php"
 
 
-def fetch_all_titles(session: requests.Session, fandom_site: str, language: str) -> list[str]:
+def fetch_all_titles(
+    session: requests.Session,
+    fandom_site: str,
+    language: str,
+    retries: int,
+    retry_delay: float,
+) -> list[str]:
     titles: list[str] = []
     params = {
         "action": "query",
@@ -58,20 +65,73 @@ def fetch_all_titles(session: requests.Session, fandom_site: str, language: str)
         "formatversion": "2",
     }
 
-    while True:
-        response = session.get(api_url(fandom_site, language), params=params, timeout=30)
-        response.raise_for_status()
-        data = response.json()
+    with tqdm(desc=f"Listing pages for {fandom_site}@{language}", unit="page") as progress:
+        while True:
+            for attempt in range(retries + 1):
+                response = session.get(api_url(fandom_site, language), params=params, timeout=30)
+                if response.status_code not in RETRY_STATUSES:
+                    response.raise_for_status()
+                    break
+                if attempt >= retries:
+                    response.raise_for_status()
+                sleep_for = retry_delay * (2**attempt)
+                print(
+                    f"Page listing got HTTP {response.status_code}; retrying in {sleep_for:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(sleep_for)
 
-        if "error" in data:
-            raise RuntimeError(data["error"].get("info", data["error"]))
+            data = response.json()
 
-        titles.extend(page["title"] for page in data.get("query", {}).get("allpages", []))
+            if "error" in data:
+                raise RuntimeError(data["error"].get("info", data["error"]))
 
-        continuation = data.get("continue")
-        if not continuation:
-            return titles
-        params.update(continuation)
+            page_titles = [page["title"] for page in data.get("query", {}).get("allpages", [])]
+            titles.extend(page_titles)
+            progress.update(len(page_titles))
+
+            continuation = data.get("continue")
+            if not continuation:
+                return titles
+            params.update(continuation)
+
+
+def title_cache_path_for(cache_dir: Path, fandom_site: str, language: str) -> Path:
+    key = f"{fandom_site}\0{language}"
+    digest = hashlib.sha256(key.encode("utf-8")).hexdigest()[:24]
+    return cache_dir / "title-lists" / f"{fandom_site}@{language}-{digest}.json"
+
+
+def read_cached_titles(path: Path) -> list[str] | None:
+    if not path.exists():
+        return None
+    try:
+        with path.open(encoding="utf-8") as infile:
+            data = json.load(infile)
+    except (OSError, json.JSONDecodeError):
+        return None
+    titles = data.get("titles") if isinstance(data, dict) else None
+    if not isinstance(titles, list) or not all(isinstance(title, str) for title in titles):
+        return None
+    return titles
+
+
+def write_cached_titles(path: Path, fandom_site: str, language: str, titles: list[str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = path.with_suffix(".tmp")
+    with tmp_path.open("w", encoding="utf-8") as outfile:
+        json.dump(
+            {
+                "fandom_site": fandom_site,
+                "language": language,
+                "count": len(titles),
+                "fetched_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+                "titles": titles,
+            },
+            outfile,
+            ensure_ascii=False,
+        )
+    tmp_path.replace(path)
 
 
 class AdaptiveThrottle:
@@ -297,9 +357,17 @@ def write_dump(
 
 def scrape_target(args: argparse.Namespace, session: requests.Session, target: str) -> None:
     fandom_site, language = parse_fandom_target(target)
-    titles = fetch_all_titles(session, fandom_site, language)
+    title_cache_path = None if args.no_cache else title_cache_path_for(args.cache_dir, fandom_site, language)
+    titles = None if args.refresh_cache or title_cache_path is None else read_cached_titles(title_cache_path)
+    if titles is not None:
+        print(f"Loaded {len(titles)} cached page titles for {target}")
+    else:
+        titles = fetch_all_titles(session, fandom_site, language, args.retries, args.retry_delay)
+        if title_cache_path is not None:
+            write_cached_titles(title_cache_path, fandom_site, language, titles)
     if not titles:
         raise RuntimeError(f"No pages found for {target}")
+    print(f"Found {len(titles)} pages for {target}; exporting in batches of {args.batch_size} with {args.workers} workers")
     write_dump(
         target,
         fandom_site,
